@@ -1,74 +1,94 @@
 #lang racket
 
-(module+ test
-    (require rackunit))
+(require "geo.rkt")
 
-(struct ors-config (lat-top lon-left lat-step lon-step))
+(provide file->ors-grid
+         port->ors-grid
+         ors-grid->ors
+         generate-flag-pole
+         eight-thousand-meter-flag-pole)
 
-(define (ors x0 y0 heightfun config)
-    (define h0 (heightfun x0 y0))
-    (define lat0 (to-lat x0 config))
-    (define lon0 (to-lon x0 config))
-    (define (r x y)
-        (haversine-dist lat0 lon0 (to-lat y config) (to-lon x config)))
-    (define (u x y)
-        (/ (- h0 (heightfun x y)) (r x y)))
-    (define (fu x y) (f (u x y)))
+(struct ors-grid (cols rows ll-lat ll-lon step grid) #:transparent)
 
-    (sqrt (trapezoid2 fu xs ys)))
-
-(define (to-lat y config)
-    (+ (config-lat-top config) (* (config-lat-step config) y)))
-
-(define (to-lon x config)
-    (+ (config-lon-left config) (* (config-lon-step config) x)))
-
-(define f-coeff (/ 1 (* pi pi pi)))
+(define f-coeff (/ 4 (* pi pi pi)))
 
 (define (f u)
-    (define atanu (atan u))
-    (* f-coeff (- (* 2 u atanu) (log (add1 (* u u))) (sqr atanu))))
-
-;; trapezoid2 : (Number, Number -> Number) -> [Number] -> [Number] -> Number
-;; 2D Trapezoid integration.
-(define (trapezoid2 f xs ys)
-    (when (or (empty? xs) (empty? ys))
-        (error 'trapezoid2 "Input sample lists cannot be empty."))
-    (define lx (sub1 (length xs)))
-    (define ly (sub1 (length ys)))
-    (define h (/ (- (list-ref xs lx) (first xs)) lx))
-    (define k (/ (- (list-ref ys ly) (first ys)) ly))
-    (define coeff (/ (* h k) 4))
-    (* coeff
-        (for*/fold ([sum 0])
-                   ([(ex ix) (in-indexed xs)]
-                    [(ey iy) (in-indexed ys)])
-            (displayln (string-append "ix: " (number->string ix) ", iy: " (number->string iy)))
-            (displayln (get-weight ix iy lx ly))
-            (+ sum (* (get-weight ix iy lx ly) (f ex ey))))))
-
-(define (get-weight ix iy len-x len-y)
     (cond
-        [(or (and (equal? ix 0) (equal? iy 0)) (and (equal? ix len-x) (equal? iy len-y)))
-         1]
-        [(or (equal? ix 0) (equal? ix len-x) (equal? iy 0) (equal? iy len-y))
-         2]
+        [(<= u 0) 0]
         [else
-         4]))
+         (define atanu (atan u))
+         (* f-coeff (- (* 2 u atanu) (log (add1 (* u u))) (sqr atanu)))]))
 
-;; haversine-dist : Latitude, Longitude, Latitude, Longitude -> Meters
-(define (haversine-dist lat1 lon1 lat2 lon2)
-    (define earth-mean-radius-m 6371000)
-    (define dist-lat (degrees->radians (- lat2 lat1)))
-    (define dist-lon (degrees->radians (- lon2 lon1)))
-    (define lat1-rad (degrees->radians lat1))
-    (define lat2-rad (degrees->radians lat2))
-    (define a (+ (sqr (sin (/ dist-lat 2))) (* (sqr (sin (/ dist-lon 2))) (cos lat1-rad) (cos lat2-rad))))
-    (define c (* 2 (atan (sqrt a) (sqrt (- 1 a)))))
-    (* earth-mean-radius-m c))
+(define (generate-flag-pole ll-lat ll-lon cols rows step height)
+    (define peak-col (inexact->exact (truncate (/ cols 2.0))))
+    (define peak-row (inexact->exact (truncate (/ rows 2.0))))
+    (define grid
+        (for/list ([y (in-range rows)])
+            (for/list ([x (in-range cols)])
+                (if (and (= peak-col x) (= peak-row y))
+                    height
+                    0))))
+    (ors-grid cols rows ll-lat ll-lon step grid))
 
-(module+ test
-    (check-equal? (haversine-dist 45 145 45 145) 0)
-    (check-equal? (round (haversine-dist 45 144 45 145)) 78626.0)
-    (check-equal? (round (haversine-dist 44 145 45 145)) 111195.0)
-    (check-equal? (round (haversine-dist 44 144 45 145)) 136578.0))
+(define (eight-thousand-meter-flag-pole) (generate-flag-pole 34.787916666663 74.038472222256 3964 3238 0.000277777778 8000))
+
+(define (integrate-grid-midpoint f xs ys xstep ystep)
+    (for*/sum ([x (in-range xs)]
+               [y (in-range ys)])
+        (* (f x y) xstep ystep)))
+
+(define (ors-grid->ors grid)
+    (define elev (ors-grid-grid grid))
+    (define cols (ors-grid-cols grid))
+    (define rows (ors-grid-rows grid))
+    (define ll-lat (ors-grid-ll-lat grid))
+    (define ll-lon (ors-grid-ll-lon grid))
+    (define step (ors-grid-step grid))
+
+    (define (heightfun col row)
+        (list-ref (list-ref elev row) col))
+    (define (col->lon col)
+        (+ ll-lon (* col step)))
+    (define (row->lat row)
+        (+ ll-lat (* row step)))
+
+    (define peak-col (inexact->exact (truncate (/ cols 2.0))))
+    (define peak-row (inexact->exact (truncate (/ rows 2.0))))
+    (define peak-height (heightfun peak-col peak-row))
+    (define peak-lon (col->lon peak-col))
+    (define peak-lat (row->lat peak-row))
+
+    (define lr-lon (normalize-lon (+ ll-lon (* step cols))))
+    (define tl-lat (normalize-lat (- ll-lat (* step rows))))
+
+    (define x-cell-dist (/ (haversine-dist ll-lat ll-lon ll-lat lr-lon) cols))
+    (define y-cell-dist (/ (haversine-dist ll-lat ll-lon tl-lat ll-lon) rows))
+
+    (define (r x y)
+        (haversine-dist peak-lat peak-lon (row->lat y) (col->lon x)))
+    (define (u x y)
+        (define dist (r x y))
+        (if (= dist 0)
+            0
+            (/ (- peak-height (heightfun x y)) dist)))
+    (define (fu x y) (f (u x y)))
+
+    (sqrt (integrate-grid-midpoint fu cols rows x-cell-dist y-cell-dist)))
+
+(define (file->ors-grid filename)
+    (call-with-input-file filename port->ors-grid #:mode 'text))
+
+(define (port->ors-grid port)
+    (define get-value (compose1 string->number second string-split))
+    (define cols (get-value (read-line port)))
+    (define rows (get-value (read-line port)))
+    (define ll-lon (get-value (read-line port)))
+    (define ll-lat (get-value (read-line port)))
+    (define step (get-value (read-line port)))
+    (read-line port)
+    (define grid
+        ;; reversed so rows are in order of increasing latitude
+        (reverse
+            (for/list ([r (in-range rows)])
+                (map string->number (string-split (read-line port))))))
+    (ors-grid cols rows ll-lat ll-lon step grid))

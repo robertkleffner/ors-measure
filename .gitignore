@@ -4,3 +4,8 @@
 .DS_Store
 compiled/
 /doc/
+
+*.bak
+auto-ors.rkt
+examine-prom.rkt
+*.asc
